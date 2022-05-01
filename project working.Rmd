@@ -1,0 +1,78 @@
+---
+title: "Project Working"
+author: "Fiore, C."
+date: "3/27/2022"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+```{r, message=FALSE}
+library(readr)
+library(tidyr)
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+library(modelr)
+```
+
+
+
+```{r}
+lau <- read.csv(file = "laucnty2020.csv", header = TRUE) #date of publication 2 MAR 2022
+lau
+```
+```{r,message=FALSE}
+ggplot(lau, aes(x=labor_force,y=unemployed, color = government)) +
+  geom_point() +   
+  scale_color_manual(values = c("Republican" = "red",
+                                "Democratic" = "blue",
+                                "Divided" = "purple")) +
+  #geom_smooth(method="lm", color="red") +
+  labs(title="No clear relationship between size of labor force and unemployment",
+              x="Total Labor Force by County", 
+       y="Unemployed People by County") +
+    theme(axis.text.x = element_text(angle = 0)) +
+  theme(legend.position = "none")
+```
+```{r}
+ggplot(lau, mapping = aes(x=as.character(st_fips_code),y=ue_rate, color = government)) +
+  geom_boxplot() +
+  labs(title="Title",
+              x="State Code", 
+       y="Unemployment") +
+    scale_color_manual(values = c("Republican" = "red",
+                                "Democratic" = "blue",
+                                "Divided" = "purple")) +
+    theme(axis.text.x = element_text(angle = 90)) +
+  facet_wrap(~government) +
+  #coord_flip() +
+  theme(legend.position = "Right")
+```
+
+```{r}
+ggplot(lau, mapping = aes(x=as.character(st_fips_code),y=ue_rate, color = government)) +
+  geom_boxplot() +
+  labs(title="Lower median unemployment rates in states with Republican-controlled governments",
+              x="State", 
+       y="Unemployment") +
+    scale_color_manual(values = c("Republican" = "red",
+                                "Democratic" = "blue",
+                                "Divided" = "purple")) +
+    theme(axis.text.x = element_text(angle = 90)) 
+  #facet_wrap(~vote) +
+  #coord_flip() +
+  #theme(legend.position = "Right") + legend(legend.title = "Government")
+```
+
+
+
+
+
+
+
+
