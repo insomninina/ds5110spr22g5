@@ -1,0 +1,1081 @@
+---
+title: "Research Report"
+author: "Carolyn Fiore, Shruti Biradar, and Kevin Russell"
+date: "4/25/2022"
+output: pdf_document
+knit: (function(inputFile, encoding) { 
+      out_f <- paste0(tools::file_path_sans_ext(basename(inputFile)), ".pdf");
+      rmarkdown::render(inputFile,
+                        encoding=encoding,
+                        output_file=file.path(dirname(inputFile), out_f)) })
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(modelr)
+library(foreach)
+library(iterators)
+library(glmnet)
+```
+
+# Initialization
+
+## Functions
+
+```{r}
+# Custom function to apply parallel processing
+parallel_proc <- function(num_of_clusters = -1){
+  library(parallel)
+  library(doParallel)
+  # https://cran.r-project.org/web/packages/doParallel/index.html
+  
+  if (num_of_clusters == -1) {
+    core_count <- parallel::detectCores() - 1
+  }
+  
+  for (proc in ps::ps_children()) {
+    if (ps::ps_name(proc) == "Rscript.exe") {
+      ps::ps_kill(proc)
+    }
+  }
+  
+  sock_cluster <- makePSOCKcluster(core_count)
+  registerDoParallel(sock_cluster)
+  return(sock_cluster)
+}
+
+# Custom function to plot PCA graph
+geom_biplot <- function(model,
+                        pc_x = 'PC1',
+                        pc_y = 'PC2',
+                        x_coords = c(),
+                        y_coords = c(),
+                        point_color = 'black',
+                        point_alpha = 1,
+                        param_color = 'black',
+                        arrow_color = 'blue',
+                        arrow_alpha = 0.75,
+                        arrow_size = 0.1,
+                        arrow = TRUE,
+                        circle = FALSE,
+                        circle_type = 't',
+                        circle_level = 0.95,
+                        circle_color = 'grey70',
+                        var_name_text_size = 3,
+                        unit_len = FALSE,
+                        unit_len_vector_amp = 1,
+                        arrow_len_vector_amp = 0.6,
+                        centroids = FALSE) {
+  require(ggplot2)
+  require(tidyverse)
+  
+  serr_func <- function(z) {
+    sd(z) / sqrt(length(z))
+  }
+  
+  model.data <- as_tibble(model$x)
+  model.rotation <- tibble(varnames = row.names(model$rotation),
+                            as_tibble(model$rotation))
+  
+  if (arrow) {
+    if (unit_len) {
+      model.rotation <- model.rotation |>
+        mutate(vector1 = unit_len_vector_amp * get(pc_x),
+               vector2 = unit_len_vector_amp * get(pc_y))
+    } else {
+      model.mult <- min((max(model.data[, pc_y]) -
+                           min(model.data[, pc_y]) /
+                           (max(model.rotation[, pc_y]) -
+                              min(model.rotation[, pc_y]))),
+                        (max(model.data[, pc_x]) -
+                           min(model.data[, pc_x]) /
+                           (max(model.rotation[, pc_x]) -
+                              min(model.rotation[, pc_x]))))
+      model.rotation <- model.rotation |>
+        mutate(vector1 = arrow_len_vector_amp * model.mult * (get(pc_x)),
+               vector2 = arrow_len_vector_amp * model.mult * (get(pc_y)))
+    }
+  }
+  
+  if (typeof(point_color) == 'character') {
+    model.plot <- model.data |>
+      ggplot(aes_string(x = pc_x, y = pc_y)) +
+      geom_point(color = point_color,
+                 alpha = point_alpha)
+  } else {
+    model.plot <- model.data |>
+      ggplot(aes_string(x = pc_x, y = pc_y)) +
+      geom_point(aes(color = point_color),
+                 alpha = point_alpha)
+  }
+  
+  if (arrow) {
+    model.plot <- model.plot +
+      geom_hline(aes(yintercept = 0),
+                 size = arrow_size) +
+      geom_vline(aes(xintercept = 0),
+                 size = arrow_size)
+    
+    if (unit_len & (length(x_coords) < 1 | length(y_coords) < 1)) {
+      x_coords <- c(-1, 1)
+      y_coords <- c(-1, 1)
+      
+      if (circle) {
+        model.angle <- seq(-pi, pi, length = 50)
+        model.circle <- tibble(x = sin(model.angle),
+                               y = cos(model.angle))
+      }
+    }
+  } else if (typeof(point_color) != 'character') {
+    centroids = TRUE
+  }
+  
+  if (centroids) {
+    gg_centroids <- aggregate(cbind(get(pc_x),
+                                    get(pc_y)) ~
+                                point_color,
+                              model.data, mean)
+    names(gg_centroids) <- c('point_color', pc_x, pc_y)
+    
+    se <- aggregate(cbind(se.x = get(pc_x),
+                          se.y = get(pc_y)) ~ point_color,
+                    model.data,
+                    serr_func)
+    gg_centroids <- merge(gg_centroids,
+                          se,
+                          by = "point_color")
+    
+    
+    model.plot <- model.plot +
+        geom_point(data = gg_centroids,
+                   size = 2,
+                   aes(color = point_color)) +
+        geom_errorbar(data = gg_centroids,
+                      aes(ymin = PC2 - se.y,
+                          ymax = PC2 + se.y,
+                          color = point_color),
+                      width = 0.1) +
+        geom_errorbarh(data = gg_centroids,
+                       aes(xmin = PC1 - se.x,
+                           xmax = PC1 + se.x,
+                           color = point_color),
+                       height=0.1)
+  }
+  
+  if (length(x_coords) < 1 | length(y_coords) < 1) {
+    model.plot <- model.plot +
+      coord_equal()
+  } else {
+    model.plot <- model.plot +
+      coord_cartesian(xlim = x_coords,
+                               ylim = y_coords)
+  }
+  
+  if (arrow) {
+    model.plot <- model.plot +
+      geom_text(data = model.rotation,
+                aes(x = vector1,
+                    y = vector2,
+                    label = varnames),
+                size = var_name_text_size,
+                vjust = 1,
+                color = param_color) +
+      geom_segment(data = model.rotation,
+                   aes(x = 0,
+                       y = 0,
+                       xend = vector1,
+                       yend = vector2),
+                   arrow = arrow(length = unit(arrow_size, 'cm')),
+                   alpha = arrow_alpha,
+                   color = arrow_color)
+  }
+  
+  if (circle & unit_len) {
+    model.plot <- model.plot +
+      geom_path(aes(x, y),
+              data = model.circle,
+              colour = circle_color)
+  } else if (circle) {
+    model.plot <- model.plot +
+      stat_ellipse(type = circle_type,
+                   level = circle_level,
+                   color = circle_color)
+  }
+  
+  return(model.plot)
+}
+```
+
+This is a function to graph principal component analysis graphs and for loading parallel processing.
+
+## Data Load
+
+```{r}
+# File Path and Directory
+script_dir <- dirname(rstudioapi::getSourceEditorContext()$path)
+pov_fp <- paste(script_dir,
+                 'df9.csv',
+                 sep = '/')
+cpi_gdp_fp <- paste(script_dir,
+                 'cpi_gdp_data.csv',
+                 sep = '/')
+
+# Read data
+cpi_gdp_data <- read_csv(cpi_gdp_fp,
+                         show_col_types = FALSE)
+pov_data <- read_csv(pov_fp,
+                     show_col_types = FALSE) |>
+  unique() |>
+  inner_join(cpi_gdp_data, by = 'fips')
+
+# Train/Test
+set.seed(1)
+pov_part <- resample_partition(pov_data,
+                                p = c(train=0.8,
+                                      test=0.2))
+train_data <- as_tibble(pov_part$train)
+test_data <- as_tibble(pov_part$test)
+```
+
+Loading and combining data with train test split of 80% train and 20% test.
+
+## Pre-Processing
+
+```{r}
+# NA's to zeros
+train_data[is.na(train_data)] <- 0
+
+# Drop all columns that has same value for all rows
+train_data <- train_data |>
+  purrr::keep(~length(unique(.x)) != 1)
+```
+
+We are amputating by replacement of NAs to zeros. Also, dropping columns with same values for all rows.
+
+# Classification
+
+## Finding Classification
+
+### Principal Component Analysis
+
+```{r}
+eda_pca_ind <- train_data |>
+  mutate(government = factor(government,
+                                levels = c('Republican',
+                                           'Divided',
+                                           'Democratic'))) |>
+  dplyr::select(c(government)) |>
+  as.vector()
+
+eda_pca_fit <- train_data |>
+  dplyr::select(c(pov_pct,
+                  wnh_pop_per,
+                  aa_pop_per,
+                  tr_pop_per,
+                  hp_pop_per,
+                  hl_pop_per,
+                  as_pop_per,
+                  aia_pop_per,
+                  other_pop_per)) |>
+  prcomp(center = TRUE,
+         scale. = TRUE)
+
+cum_porp <- cumsum(eda_pca_fit$sdev^2 / sum(eda_pca_fit$sdev^2))
+perc_80_x <- which(abs(cum_porp - .82) == min(abs(cum_porp - .82)))
+
+plot(cum_porp,
+     type="b",
+     main = '84% of Variation is by 5 Components',
+     xlab = 'Principal Components by #',
+     ylab = 'Cumulative Proportion')
+
+points(perc_80_x,
+       cum_porp[perc_80_x],
+       col = "red",
+       cex = 2,
+       pch = 20)
+```
+
+The first two Principal Components explains 51% of the variation whereas 5 components explain 84% of variation. This is okay but not excellent considering that we started with 9 variables. Let's plot the principal components on a graph.
+
+```{r, warning = FALSE}
+geom_biplot(eda_pca_fit,
+            circle = TRUE,
+            unit_len = TRUE,
+            unit_len_vector_amp = 1.25,
+            point_color = eda_pca_ind$government,
+            param_color = 'purple',
+            arrow_color = 'brown',
+            centroids = TRUE) +
+  labs(x = "PC1",
+       y = "PC2",
+       color = 'Government',
+       title = 'EDA - Principal Components 1 & 2') +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+African American Population Percent and American Indian Alaskan Population Percent correlate the most to poverty percent. However, the remaining doesn't correlate that much with poverty percent. Let's look at the individual distributions.
+
+### EDA - Potential Predictors
+
+```{r, warning = FALSE}
+g1 <- ggplot(train_data,
+       aes(x = tr_pop_per,
+           y = pov_pct)) +
+  geom_point(color = 'green') +
+  geom_smooth(formula = y ~ s(x, bs = "cs"),
+              method = 'gam',
+              color = 'black') +
+  geom_smooth(formula = y ~ x,
+              method='lm',
+              color='red') +
+  scale_x_log10() +
+  scale_y_log10() +
+  labs(x = "TR Population Percent",
+       y = "Poverty Percent",
+       title = 'Increases with TR POP %') +
+  theme(plot.title = element_text(hjust = 0.5))
+
+g2 <- ggplot(train_data,
+       aes(x = wnh_pop_per,
+           y = pov_pct)) +
+  geom_point(color = 'blue') +
+  geom_smooth(formula = y ~ s(x, bs = "cs"),
+              method = 'gam',
+              color = 'black') +
+  geom_smooth(formula = y ~ x,
+              method='lm',
+              color='red') +
+  labs(x = "WNH Population Percent",
+       y = "Poverty Percent",
+       title = 'Decreases with WNH POP %') +
+  theme(plot.title = element_text(hjust = 0.5))
+
+g3 <- ggplot(train_data,
+       aes(x = aa_pop_per,
+           y = pov_pct)) +
+  geom_point(color = 'brown') +
+  geom_smooth(formula = y ~ s(x, bs = "cs"),
+              method = 'gam',
+              color = 'black') +
+  geom_smooth(formula = y ~ x,
+              method='lm',
+              color='red') +
+  scale_x_log10() +
+  scale_y_log10() +
+  labs(x = "AA Population Percent",
+       y = "Poverty Percent",
+       title = 'Increases with AA POP %') +
+  theme(plot.title = element_text(hjust = 0.5))
+
+g4 <- ggplot(train_data,
+       aes(x = aia_pop_per,
+           y = pov_pct)) +
+  geom_point(color = 'orange') +
+  geom_smooth(formula = y ~ s(x, bs = "cs"),
+              method = 'gam',
+              color = 'black') +
+  geom_smooth(formula = y ~ x,
+              method='lm',
+              color='red') +
+  scale_x_log10() +
+  scale_y_log10() +
+  labs(x = "AIA Population Percent",
+       y = "Poverty Percent",
+       title = 'Increases with AIA POP %') +
+  theme(plot.title = element_text(hjust = 0.5))
+
+g5 <- ggplot(train_data,
+       aes(x = as_pop_per,
+           y = pov_pct)) +
+  geom_point(color = 'purple') +
+  geom_smooth(formula = y ~ s(x, bs = "cs"),
+              method = 'gam',
+              color = 'black') +
+  geom_smooth(formula = y ~ x,
+              method='lm',
+              color='red') +
+  scale_x_log10() +
+  scale_y_log10() +
+  labs(x = "AS Population Percent",
+       y = "Poverty Percent",
+       title = 'Decreases with AS POP %') +
+  theme(plot.title = element_text(hjust = 0.5))
+
+g6 <- ggplot(train_data,
+             aes(x = hl_pop_per,
+                 y = pov_pct)) +
+  geom_point(color = 'pink') +
+  geom_smooth(formula = y ~ s(x, bs = "cs"),
+              method = 'gam',
+              color = 'black') +
+  geom_smooth(formula = y ~ x,
+                method='lm',
+                color='red') +
+  scale_x_log10() +
+  scale_y_log10() +
+  labs(x = "HL Population Percent",
+       y = "Poverty Percent",
+       title = 'Increases with HL POP %') +
+  theme(plot.title = element_text(hjust = 0.5))
+
+g7 <- ggplot(train_data,
+             aes(x = hp_pop_per,
+                 y = pov_pct)) +
+  geom_point(color = 'Aquamarine') +
+  geom_smooth(formula = y ~ s(x, bs = "cs"),
+              method = 'gam',
+              color = 'black') +
+  geom_smooth(formula = y ~ x,
+              method='lm',
+              color='red') +
+  scale_x_log10() +
+  scale_y_log10() +
+  labs(x = "HP Population Percent",
+       y = "Poverty Percent",
+       title = 'No Change with HP POP %') +
+  theme(plot.title = element_text(hjust = 0.5))
+
+g8 <- ggplot(train_data,
+             aes(x = other_pop_per,
+                 y = pov_pct)) +
+  geom_point(color = 'deepskyblue3') +
+  geom_smooth(formula = y ~ s(x, bs = "cs"),
+              method = 'gam',
+              color = 'black') +
+  geom_smooth(formula = y ~ x,
+              method='lm',
+              color='red') +
+  scale_x_log10() +
+  scale_y_log10() +
+  labs(x = "OP Population Percent",
+       y = "Poverty Percent",
+       title = 'Increases with OP POP %') +
+  theme(plot.title = element_text(hjust = 0.5))
+
+gridExtra::grid.arrange(g1, g2, g3, g4, g5, g6, g7, g8,
+                        top = 'EDA - Finding Potential Predictors')
+```
+
+Two or More Population Percent, African American Population Percent, American Indian Alaskan Population Percent, Hispanic Latino Population Percent, and Other Race Population Percent has a positive relationship with Poverty Percent whereas the other measurements do not. Let's confirm this with the test data.
+
+## Confirming Potential Predictors
+
+```{r, warning = FALSE}
+g1 <- ggplot(test_data,
+       aes(x = tr_pop_per,
+           y = pov_pct)) +
+  geom_point(color = 'green') +
+  geom_smooth(formula = y ~ s(x, bs = "cs"),
+              method = 'gam',
+              color = 'black') +
+  geom_smooth(formula = y ~ x,
+              method='lm',
+              color='red') +
+  scale_x_log10() +
+  scale_y_log10() +
+  labs(x = "TR Population Percent",
+       y = "Poverty Percent",
+       title = 'Increases with TR POP %') +
+  theme(plot.title = element_text(hjust = 0.5))
+
+g2 <- ggplot(test_data,
+       aes(x = wnh_pop_per,
+           y = pov_pct)) +
+  geom_point(color = 'blue') +
+  geom_smooth(formula = y ~ s(x, bs = "cs"),
+              method = 'gam',
+              color = 'black') +
+  geom_smooth(formula = y ~ x,
+              method='lm',
+              color='red') +
+  labs(x = "WNH Population Percent",
+       y = "Poverty Percent",
+       title = 'Decreases with WNH POP %') +
+  theme(plot.title = element_text(hjust = 0.5))
+
+g3 <- ggplot(test_data,
+       aes(x = aa_pop_per,
+           y = pov_pct)) +
+  geom_point(color = 'brown') +
+  geom_smooth(formula = y ~ s(x, bs = "cs"),
+              method = 'gam',
+              color = 'black') +
+  geom_smooth(formula = y ~ x,
+              method='lm',
+              color='red') +
+  scale_x_log10() +
+  scale_y_log10() +
+  labs(x = "AA Population Percent",
+       y = "Poverty Percent",
+       title = 'Increases with AA POP %') +
+  theme(plot.title = element_text(hjust = 0.5))
+
+g4 <- ggplot(test_data,
+       aes(x = aia_pop_per,
+           y = pov_pct)) +
+  geom_point(color = 'orange') +
+  geom_smooth(formula = y ~ s(x, bs = "cs"),
+              method = 'gam',
+              color = 'black') +
+  geom_smooth(formula = y ~ x,
+              method='lm',
+              color='red') +
+  scale_x_log10() +
+  scale_y_log10() +
+  labs(x = "AIA Population Percent",
+       y = "Poverty Percent",
+       title = 'Increases with AIA POP %') +
+  theme(plot.title = element_text(hjust = 0.5))
+
+g5 <- ggplot(test_data,
+       aes(x = as_pop_per,
+           y = pov_pct)) +
+  geom_point(color = 'purple') +
+  geom_smooth(formula = y ~ s(x, bs = "cs"),
+              method = 'gam',
+              color = 'black') +
+  geom_smooth(formula = y ~ x,
+              method='lm',
+              color='red') +
+  scale_x_log10() +
+  scale_y_log10() +
+  labs(x = "AS Population Percent",
+       y = "Poverty Percent",
+       title = 'Decreases with AS POP %') +
+  theme(plot.title = element_text(hjust = 0.5))
+
+g6 <- ggplot(test_data,
+             aes(x = hl_pop_per,
+                 y = pov_pct)) +
+  geom_point(color = 'pink') +
+  geom_smooth(formula = y ~ s(x, bs = "cs"),
+              method = 'gam',
+              color = 'black') +
+  geom_smooth(formula = y ~ x,
+                method='lm',
+                color='red') +
+  scale_x_log10() +
+  scale_y_log10() +
+  labs(x = "HL Population Percent",
+       y = "Poverty Percent",
+       title = 'Increases with HL POP %') +
+  theme(plot.title = element_text(hjust = 0.5))
+
+g7 <- ggplot(test_data,
+             aes(x = hp_pop_per,
+                 y = pov_pct)) +
+  geom_point(color = 'Aquamarine') +
+  geom_smooth(formula = y ~ s(x, bs = "cs"),
+              method = 'gam',
+              color = 'black') +
+  geom_smooth(formula = y ~ x,
+              method='lm',
+              color='red') +
+  scale_x_log10() +
+  scale_y_log10() +
+  labs(x = "HP Population Percent",
+       y = "Poverty Percent",
+       title = 'No Change with HP POP %') +
+  theme(plot.title = element_text(hjust = 0.5))
+
+g8 <- ggplot(test_data,
+             aes(x = other_pop_per,
+                 y = pov_pct)) +
+  geom_point(color = 'deepskyblue3') +
+  geom_smooth(formula = y ~ s(x, bs = "cs"),
+              method = 'gam',
+              color = 'black') +
+  geom_smooth(formula = y ~ x,
+              method='lm',
+              color='red') +
+  scale_x_log10() +
+  scale_y_log10() +
+  labs(x = "OP Population Percent",
+       y = "Poverty Percent",
+       title = 'No Change with OP POP %') +
+  theme(plot.title = element_text(hjust = 0.5))
+
+gridExtra::grid.arrange(g1, g2, g3, g4, g5, g6, g7, g8,
+                        top = 'CDA - Finding Potential Predictors')
+```
+
+Test data shows that Two or More Population Percent, African American Population Percent, American Indian Alaskan Population Percent, and Hispanic Latino Population Percent are still positively correlated with poverty percent. However, Other Race Population Percent has no effect with poverty percent. This is potentially expected since the increase in the EDA was slight.
+
+For the model, we will choose classification by identifying Impoverished counties by measuring the poverty percent for the county against the national poverty rate. Any county that meets or exceeds the 11.4% poverty rate would be considered Impoverished and anything below 11.4% poverty rate would be considered Not Impoverished. For comparison, the graphs above somewhat shows a similar pattern of turning positive around the 10-15% area.
+
+The Null Hypothesis will be that Two or More Population Percent, African American Population Percent, American Indian Alaskan Population Percent, and Hispanic Latino Population Percent has no influence with classifying Impoverished. The Alternative Hypothesis is that these measurements do influence the classifying of Impoverished. The alpha will be 0.01.
+
+## Creating Classification
+
+```{r}
+# To convert government category to integer
+gov_parties <- unique(pov_data$government)
+gov_parties <- tibble(gov_party_id = 1:length(gov_parties),
+                      gov_party_name = gov_parties)
+
+# Classify, Convert to Int, and Remove Bias
+tidy_data <- pov_data |>
+  left_join(gov_parties, by = c('government' = 'gov_party_name')) |>
+  mutate(poverty = factor(ifelse(pov_pct >= 11.4, # National Poverty Rate 11.4
+                          'Impoverished',
+                          'Not Impoverished'),
+                          levels = c('Impoverished',
+                          'Not Impoverished'))) |>
+  select(!c(ends_with('_belowPoverty'),
+           ends_with('_abovePoverty'),
+           ends_with('_TE'),
+           ends_with('_povpct'),
+           ends_with('_BP'),
+           starts_with('pov_count'),
+           starts_with('pov_ct'),
+           wnh_pop_per,
+           as_pop_per,
+           hp_pop_per,
+           other_pop_per,
+           `...1`,
+           cty_pop,
+           pov_pct,
+           X1A_0C_PW))
+
+# Train/Test
+set.seed(2)
+pov_part <- resample_partition(tidy_data,
+                               p = c(train=0.7,
+                                     test=0.3))
+train_data <- as_tibble(pov_part$train) |>
+  select(!c(region.x, Subregion, government))
+test_data <- as_tibble(pov_part$test) |>
+  select(!c(region.x, Subregion, government))
+```
+
+## Pre-Processing Again
+
+```{r}
+# NA's to zeros
+train_data[is.na(train_data)] <- 0
+test_data[is.na(test_data)] <- 0
+
+# Drop all columns that has same value for all rows
+train_data <- train_data |>
+  purrr::keep(~length(unique(.x)) != 1)
+test_data <- test_data |>
+  purrr::keep(~length(unique(.x)) != 1)
+```
+
+# Model Fitting
+
+## Logistic Fitting
+
+```{r}
+bad_mod <- glm(poverty ~ .,
+                data = train_data,
+                family = binomial(link = 'logit'))
+```
+
+The fitting for logistic regression did not converge suggesting that there are predictor variable(s) that perfectly separate the response variable. In order to fix this issue, penalized regression will have to be implemented to filter the noise. We will be choosing lasso regression to reduce the noise.
+
+## Lasso Fitting
+
+```{r}
+library(caret)
+library(LncFinder)
+
+set.seed(3)
+train_data_ds <- train_data |>
+  dplyr::select(-poverty) |>
+  downSample(train_data$poverty,
+             list=FALSE,
+             yname = 'poverty')
+
+open_clusters <- parallel_proc()
+
+set.seed(3)
+pov_mod1 <- tryCatch(cv.glmnet(as.matrix(train_data_ds |>
+                                 select(-poverty)),
+                               train_data_ds$poverty,
+                               family = 'binomial',
+                               nfolds = 10,
+                               parallel = TRUE,
+                               maxit=1000000),
+                      error = function(e) print(e))
+
+stopCluster(open_clusters)
+
+pov_coefs <- attributes(coef(pov_mod1,
+                    s=pov_mod1$lambda.min))
+pov_coefs <- tibble(
+  word = pov_coefs$Dimnames[[1]][pov_coefs$i + 1],
+  coef = pov_coefs$x)
+
+pov_coefs
+```
+
+Lasso Regression was able to extract fips, livingwage, MW, cty_pop, pov_count, labor_force, unemployed, ue_rate, GDP, CPI_Dairy_And_Related_Products, CPI_Education_And_Communication_Commodities, CPI_Education_And_Communication_Services, CPI_Electricity, CPI_Gasoline,_Unleaded_Regular, CPI_New_Vehicles, CPI_Other_Personal_Services, CPI_Utility_(Piped)_Gas_Service, and gov_party_id as selected predictors. Let's see how good lasso predicted Poverty.
+
+```{r}
+plot(roc.glmnet(pov_mod1,
+                newx = as.matrix(test_data |>
+                                   dplyr::select(-poverty)),
+                newy = test_data$poverty,
+                s=pov_mod1$lambda.min),
+     main = 'Lasso Regression ROC')
+```
+
+According to the ROC, the curve is okay but not great. Lets look at the confusion matrix. As we can see, the data is unbalanced to the positive classification.
+
+\newpage
+
+```{r}
+lasso_probs <- predict(pov_mod1,
+                       newx = as.matrix(test_data |>
+                                          dplyr::select(-poverty)),
+                       s=pov_mod1$lambda.min,
+                       type = "class")
+
+caret::confusionMatrix(
+  factor(data.frame(lasso_probs)$s1,
+         levels = c('Impoverished',
+                    'Not Impoverished')),
+  test_data$poverty,
+  positive = 'Impoverished',
+  mode = "everything")
+```
+
+As we can see, the F1 score is 85%, Sensitivity is 89%, Specificity is 56%, and Overall Accuracy is 79%. Additionally, the p-value is less than 0.01 and all four poverty percent measurements are parameters within the model. Therefore, we can safely reject the Null Hypothesis.
+
+```{r}
+open_clusters <- parallel_proc()
+
+set.seed(3)
+pov_mod2 <- tryCatch(cv.glmnet(as.matrix(train_data_ds |>
+                                 select(-poverty)),
+                               train_data_ds$poverty,
+                               family = 'binomial',
+                               nfolds = 10,
+                               parallel = TRUE,
+                               relax = TRUE,
+                               maxit=1000000),
+                      error = function(e) print(e))
+
+stopCluster(open_clusters)
+
+pov_coefs2 <- attributes(coef(pov_mod2,
+                    s=pov_mod2$lambda.min))
+pov_coefs2 <- tibble(
+  word = pov_coefs2$Dimnames[[1]][pov_coefs2$i + 1],
+  coef = pov_coefs2$x)
+
+pov_coefs2
+```
+
+```{r}
+plot(roc.glmnet(pov_mod2,
+                newx = as.matrix(test_data |>
+                                   dplyr::select(-poverty)),
+                newy = test_data$poverty,
+                s=pov_mod1$lambda.min),
+     main = 'Elastic Net Regression ROC')
+```
+
+```{r}
+elastic_probs <- predict(pov_mod2,
+                       newx = as.matrix(test_data |>
+                                          dplyr::select(-poverty)),
+                       s=pov_mod1$lambda.min,
+                       type = "class")
+
+caret::confusionMatrix(
+  factor(data.frame(elastic_probs)$s1,
+         levels = c('Impoverished',
+                    'Not Impoverished')),
+  test_data$poverty,
+  positive = 'Impoverished',
+  mode = "everything")
+```
+
+```{r}
+tune_svm <- function(formula,
+         data,
+         kernel = 'radial',
+         positive.class = 'NonCoding',
+         seed = 1,
+         num.of.folds = 10,
+         gamma.range = (2 ^ seq(-15, 0, 1)),
+         cost.range = c(0.001 , 0.01, 0.1, 1,5, 10,30, 50, 75, 100),
+         parallel = FALSE,
+         best.fit.only = TRUE,
+         ...) {
+  require(foreach)
+  require(iterators)
+  require(tidyverse)
+  
+  label_name <- as.character(formula)[2]
+  label_id <- which(names(data) == label_name)
+  names(data)[[label_id]] <- 'intercept'
+  data$intercept <- as.factor(data$intercept)
+  results <- c()
+  
+  set.seed(seed)
+  kfolds <- caret::createFolds(data$intercept,
+                               k = num.of.folds,
+                               returnTrain = TRUE)
+  names(data)[[label_id]] <- label_name
+  
+  parallel_proc <- function(num_of_clusters = -1){
+    require(parallel)
+    require(doParallel)
+    
+    if (num_of_clusters == -1) {
+      core_count <- parallel::detectCores() - 1
+    }
+    
+    for (proc in ps::ps_children()) {
+      if (ps::ps_name(proc) == "Rscript.exe") {
+        ps::ps_kill(proc)
+      }
+    }
+    
+    sock_cluster <- makePSOCKcluster(core_count)
+    registerDoParallel(sock_cluster)
+    return(sock_cluster)
+  }
+  
+  tune_svm <- function(partition,
+                       cost,
+                       formula,
+                       kernel,
+                       positive.class,
+                       label_name,
+                       ...) {
+    require(tidyverse)
+    train_data <- data[partition, ]
+    test_data <- data[-partition, ]
+    svm_mod <- e1071::svm(formula,
+                          data = train_data,
+                          scale = TRUE,
+                          probability = TRUE,
+                          kernel = kernel,
+                          cost = cost,
+                          ...)
+    svm_probs <- stats::predict(svm_mod,
+                                test_data,
+                                probability = TRUE)
+    svm_conf <- caret::confusionMatrix(tibble(probs = svm_probs)$probs,
+                                       test_data[label_name][[1]],
+                                       positive = positive.class,
+                                       mode = 'everything')
+    result <- tibble(Sensitivity = svm_conf$byClass[1],
+                     Specificity = svm_conf$byClass[2],
+                     Accuracy = svm_conf$overall[1],
+                     FMeasure = svm_conf$byClass[7],
+                     Kappa = svm_conf$overall[2])
+
+    return(result)
+  }
+  
+  proc_tune_res <- function(svm_results) {
+    avg_result <- apply(svm_results, 1, as.numeric)
+    avg_result <- data.frame(Avg_Res = t(avg_result))
+    avg_result$Avg_Res <- rowMeans(avg_result)
+    return(avg_result)
+  }
+  
+  par_cluster <- NULL
+  
+  if (parallel) {
+    message('+ Turning on Process Clusters')
+    par_cluster <- parallel_proc()
+  }
+  
+  results <- c()
+  message('+ Starting SVM Tuning...')
+  
+  if (kernel == 'linear') {
+    for (cost in cost.range) {
+      message('- cost = ',
+              cost)
+      if (!is.null(par_cluster)) {
+          svm_res <- parallel::parSapply(par_cluster,
+                                         kfolds,
+                                         tune_svm,
+                                         cost = cost,
+                                         formula = formula,
+                                         kernel = kernel,
+                                         label_name = label_name,
+                                         positive.class = positive.class
+                                         )
+        } else {
+          svm_res <- sapply(kfolds,
+                            tune_svm,
+                            cost = cost,
+                            formula = formula,
+                            kernel = kernel,
+                            label_name = label_name,
+                            positive.class = positive.class
+                            )
+        }
+      
+        svm_res <- proc_tune_res(svm_res)
+        print(t(svm_res[ncol(svm_res)]))
+        results <- c(results, list(svm_res))
+        names(results)[length(results)] <- paste0('Cost = ',
+                                                 cost)
+    }
+  } else {
+    for (gamma in gamma.range) {
+      for (cost in cost.range) {
+        message('- gamma = ',
+                gamma,
+                ', cost = ',
+                cost)
+        if (!is.null(par_cluster)) {
+          svm_res <- parallel::parSapply(par_cluster,
+                                         kfolds,
+                                         tune_svm,
+                                         gamma = gamma,
+                                         cost = cost,
+                                         formula = formula,
+                                         kernel = kernel,
+                                         label_name = label_name,
+                                         positive.class = positive.class
+                                         )
+        } else {
+          svm_res <- sapply(kfolds,
+                            tune_svm,
+                            gamma = gamma,
+                            cost = cost,
+                            formula = formula,
+                            kernel = kernel,
+                            label_name = label_name,
+                            positive.class = positive.class
+                            )
+        }
+        
+        svm_res <- proc_tune_res(svm_res)
+        print(t(svm_res[ncol(svm_res)]))
+        results <- c(results, list(svm_res))
+        names(results)[length(results)] <- paste0('gamma = ',
+                                                 gamma,
+                                                 ', Cost = ',
+                                                 cost)
+      }
+    }
+  }
+  
+  if (!is.null(parallel)) {
+    parallel::stopCluster(par_cluster)
+  }
+  
+  message("\n", paste("Best", str_to_title(kernel), "Model:"))
+  acc_conf <- sapply(results, function(x) x[3, ncol(results[[1]])])
+  best_conf <- results[acc_conf == max(acc_conf)][1]
+  message("$ ", names(best_conf))
+  print(t(best_conf[[1]][ncol(results[[1]])]))
+  
+  if (kernel == 'linear') {
+    best_cost <- as.numeric(strsplit(names(best_conf),
+                                   ' = ')[[1]][[2]])
+    if (best.fit.only) {
+      message('\n', '+ Training Best Model:')
+      best_svm <- e1071::svm(formula,
+                          data = data,
+                          scale = TRUE,
+                          probability = TRUE,
+                          kernel = kernel,
+                          cost = best_cost,
+                          ...)
+      message('\n', '+ Tuning Complete')
+      return(best_svm)
+    } else {
+      message('\n', '+ Tuning Complete')
+      return(list(Best_Cost = best_cost,
+                  Models = results))
+    }
+  } else {
+    best_cost <- as.numeric(strsplit(strsplit(names(best_conf),
+                                            ', ')[[1]][[2]],
+                                   ' = ')[[1]][[2]])
+    best_gamma <- as.numeric(strsplit(strsplit(names(best_conf),
+                                            ', ')[[1]][[1]],
+                                   ' = ')[[1]][[2]])
+    if (best.fit.only) {
+      message('\n', '+ Training Best Model:')
+      best_svm <- e1071::svm(formula,
+                          data = data,
+                          scale = TRUE,
+                          probability = TRUE,
+                          kernel = kernel,
+                          gamma = gamma,
+                          cost = best_cost,
+                          ...)
+      message('\n', '+ Tuning Complete')
+      return(best_svm)
+    } else {
+      message('\n', '+ Tuning Complete')
+      return(list(Best_Cost = best_cost,
+                  Best_Gamma = best_gamma,
+                  Models = results))
+    }
+  }
+}
+
+# support vector machine
+svm_conf <- function(model,
+                     data,
+                     response.class,
+                     positive.class = 'NonCoding') {
+  svm_probs <- stats::predict(model,
+                              data,
+                              probability = TRUE)
+  conf <- caret::confusionMatrix(tibble(probs = svm_probs)$probs,
+                                     response.class,
+                                     positive = positive.class,
+                                     mode = 'everything')
+  return(conf)
+}
+
+svm_mod1 <- e1071::svm(poverty ~ .,
+                       data = train_data_ds,
+                       scale = TRUE,
+                       probability = TRUE,
+                       kernel = 'radial',
+                       gamma = 0.0312125,
+                       cost = 0.1)
+
+svm_conf(svm_mod1, test_data, test_data$poverty, 'Impoverished')
+```
+
+Couldn't find a better tune for this model with SVM.
+
+```{r}
+# gradient boosting
+require(gbm)
+
+set.seed(3)
+bst_mod1 <- gbm(poverty ~ .,
+                data = train_data_ds,
+                distribution = "multinomial",
+                n.trees = 500,
+                shrinkage = 0.04,
+                cv.folds = 10,
+                n.minobsinnode = 10,
+                interaction.depth = 5)
+
+pred_test = predict.gbm(object = bst_mod1,
+                        newdata = test_data,
+                        n.trees = 500,
+                        type = "response")
+
+class_names = colnames(pred_test)[apply(pred_test, 1, which.max)]
+
+caret::confusionMatrix(factor(class_names,
+                              levels = c('Impoverished',
+                                         'Not Impoverished')),
+                       test_data$poverty,
+                       positive = 'Impoverished',
+                       mode = 'everything')
+```
+
+Gradient boosting looks great but specificity isn't nearly as good as its sensitivity.

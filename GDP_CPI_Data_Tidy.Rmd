@@ -1,0 +1,592 @@
+---
+title: "Project_Data"
+author: "Carolyn Fiore, Shruti Biradar, and Kevin Russell"
+date: "3/22/2022"
+output: pdf_document
+knit: (function(inputFile, encoding) { 
+      out_f <- paste0(tools::file_path_sans_ext(basename(inputFile)), ".pdf");
+      rmarkdown::render(inputFile,
+                        encoding=encoding, 
+                        output_file=file.path(dirname(inputFile), out_f)) })
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(readxl)
+library(tidyverse)
+library(RSQLite)
+library(zipcodeR)
+library(ggplot2)
+
+script_dir <- dirname(rstudioapi::getSourceEditorContext()$path)
+```
+
+```{r gdpdataload, warning = FALSE, include=FALSE}
+gdp_county_fix_list <-
+  list(
+    'Idaho_Fremont (Includes Yellowstone National Park)' = 'Fremont',
+    'New Mexico_Doña Ana' = 'Dona Ana'
+  )
+gdp_fp <- paste0(script_dir,
+                  "/gdp/lagdp1221.xlsx")
+gdp_df <- read_excel(gdp_fp,
+           sheet = 'Table 1',
+           range = 'A4:E3223',
+           skip = 4)
+names(gdp_df)[1] <- c('County')
+gdp_df <- gdp_df |>
+  rowid_to_column()
+
+states_ind <- gdp_df |>
+  filter(is.na(County)) |>
+  select(rowid) |>
+  as.vector() + 1
+
+states_ind <- c(t(states_ind), 1)
+
+gdp_data <- gdp_df |>
+  filter(!is.na(County)) |>
+  mutate(County = ifelse(County == 'United States',
+                         paste0(County,
+                                ';NA;NA'),
+                         ifelse(rowid %in% states_ind,
+                         paste0('NA;',
+                                County,
+                                ';NA'),
+                         paste0('NA;NA;',
+                                County))),
+         GDP = `2020`) |>
+  separate(County,
+           c('Country', 'State', 'County'),
+           ';',
+           convert = TRUE) |>
+  tidyr::fill(Country,
+              State,
+              .direction ='down') |>
+  select(Country,
+         State,
+         County,
+         GDP) |>
+  mutate(County = ifelse(regexpr('\\+', County) > 0,
+                         str_split(County, '\\+'),
+                         County)) |>
+  unnest(County) |>
+  mutate(County = ifelse(regexpr(',', County) > 0,
+                         str_split(County, ','),
+                         County)) |>
+  unnest(County) |>
+  mutate(County = ifelse(is.na(County),
+                         County,
+                         str_to_title(str_trim(County))),
+         County = ifelse(paste0(State,
+                         '_',
+                         County) %in% names(gdp_county_fix_list),
+                  as.character(gdp_county_fix_list[paste0(State,
+                         '_',
+                         County)]),
+                  County),
+         GDP = ifelse(regexpr('(NA)', GDP) > 0,
+                      NA,
+                      GDP),
+         GDP = ifelse(is.na(GDP),
+                      NA,
+                      as.double(GDP))) |>
+  tibble()
+
+map_conv <- list(
+  'Alaska_Chugach Census Area1' = 'Chugach Census Area',
+  'Alaska_Copper River Census Area1' = 'Copper River Census Area',
+  'Alaska_Juneau City And Borough' = 'Juneau City and Borough',
+  'Alaska_Lake And Peninsula Borough' = 'Lake and Peninsula Borough',
+  'Alaska_Petersburg Borough' = 'Petersburg Census Area',
+  'Alaska_Prince Of Wales-Hyder Census Area' = 'Prince of Wales-Hyder Census Area',
+  'Alaska_Sitka City And Borough' = 'Sitka City and Borough',
+  'Alaska_Valdez-Cordova Census Area1' = 'Valdez-Cordova Census Area',
+  'Alaska_Wrangell City And Borough' = 'Wrangell City and Borough',
+  'Alaska_Yakutat City And Borough' = 'Yakutat City and Borough',
+  'Florida_Desoto' = 'DeSoto County',
+  'Georgia_Dekalb' = 'DeKalb County',
+  'Georgia_Mcduffie' = 'McDuffie County',
+  'Georgia_Mcintosh' = 'McIntosh County',
+  'Illinois_Dekalb' = 'DeKalb County',
+  'Illinois_Dupage' = 'DuPage County',
+  'Illinois_Lasalle' = 'LaSalle County',
+  'Illinois_Mcdonough' = 'McDonough County',
+  'Illinois_Mchenry' = 'McHenry County',
+  'Illinois_Mclean' = 'McLean County',
+  'Indiana_Dekalb' = 'DeKalb County',
+  'Indiana_Lagrange' = 'LaGrange County',
+  'Indiana_Laporte' = 'LaPorte County',
+  "Iowa_O'brien" = "O'Brien County",
+  'Kansas_Mcpherson' = 'McPherson County',
+  'Kentucky_Mccracken' = 'McCracken County',
+  'Kentucky_Mccreary' = 'McCreary County',
+  'Kentucky_Mclean' = 'McLean County',
+  'Louisiana_Lasalle' = 'La Salle Parish',
+  'Louisiana_St. John The Baptist' = 'St. John the Baptist Parish',
+  'Maryland_Baltimore City' = 'Baltimore city',
+  'Minnesota_Lac Qui Parle' = 'Lac qui Parle County',
+  'Minnesota_Lake Of The Woods' = 'Lake of the Woods County',
+  'Minnesota_Mcleod' = 'McLeod County',
+  'Louisiana_Desoto' = 'De Soto Parish',
+  'Missouri_Dekalb' = 'DeKalb County',
+  'Missouri_Mcdonald' = 'McDonald County',
+  'Missouri_St. Louis City' = 'St. Louis city',
+  'Montana_Lewis And Clark' = 'Lewis and Clark County',
+  'Montana_Mccone' = 'McCone County',
+  'Nebraska_Mcpherson' = 'McPherson County',
+  'Nevada_Carson City' = 'Carson City',
+  'New Mexico_Mckinley' = 'McKinley County',
+  'North Carolina_Mcdowell' = 'McDowell County',
+  'North Dakota_Lamoure' = 'LaMoure County',
+  'North Dakota_Mchenry' = 'McHenry County',
+  'North Dakota_Mclean' = 'McLean County',
+  'Oklahoma_Mcclain' = 'McClain County',
+  'Oklahoma_Mccurtain' = 'McCurtain County',
+  'Oklahoma_Mcintosh' = 'McIntosh County',
+  'Pennsylvania_Mckean' = 'McKean County',
+  'South Carolina_Mccormick' = 'McCormick County',
+  'Tennessee_Dekalb' = 'DeKalb County',
+  'Tennessee_Mcminn' = 'McMinn County',
+  'Tennessee_Mcnairy' = 'McNairy County',
+  'Texas_Dewitt' = 'DeWitt County',
+  'Texas_Mcculloch' = 'McCulloch County',
+  'Texas_Mclennan' = 'McLennan County',
+  'Texas_Mcmullen' = 'McMullen County',
+  'Virginia_Isle Of Wight' = 'Isle of Wight County',
+  'Virginia_King And Queen' = 'King and Queen County',
+  'Virginia_Fairfax City' = 'Fairfax County',
+  'North Dakota_Mcintosh' = 'McIntosh County',
+  'North Dakota_Mckenzie' = 'McKenzie County',
+  'Mississippi_Desoto' = 'DeSoto County',
+  'South Dakota_Mccook' = 'McCook County',
+  'South Dakota_Mcpherson' = 'McPherson County',
+  'West Virginia_Mcdowell' = 'McDowell County',
+  'Wisconsin_Fond Du Lac' = 'Fond du Lac County',
+  'Alabama_Dekalb' = 'DeKalb County'
+)
+
+gdp_data <- gdp_data |>
+  mutate(County = ifelse(State == 'District of Columbia',
+                         'District of Columbia',
+                         County),
+         County2 = ifelse(State %in% c('Alaska', 'District of Columbia'),
+                          County,
+                          paste(County,
+                                ifelse(State == 'Louisiana',
+                                       'Parish',
+                                       'County'))),
+         County3 = ifelse(paste(State,
+                               County,
+                               sep = '_') %in% names(map_conv),
+                         as.character(map_conv[paste(State,
+                               County,
+                               sep = '_')]),
+                               paste(County,
+                                     'city'))) |>
+  left_join(tidycensus::fips_codes, by = c('State' = 'state_name',
+                                           'County2' = 'county')) |>
+  left_join(tidycensus::fips_codes, by = c('State' = 'state_name',
+                                           'County3' = 'county')) |>
+  tibble() |>
+  mutate(state_code = ifelse(is.na(state_code.x),
+                             state_code.y,
+                             state_code.x),
+         county_code = ifelse(is.na(county_code.x),
+                              county_code.y,
+                              county_code.x),
+         fips = ifelse(is.na(state_code) |
+                         is.na(county_code),
+                       NA,
+                       paste0(state_code, county_code)),
+         fips = as.integer(fips)) |>
+  select(!c(state_code.x,
+            state_code.y,
+            state_code,
+            county_code,
+            county_code.x,
+            county_code.y,
+            County2,
+            County3,
+            state.x,
+            state.y))
+```
+
+```{r cpidataload}
+# https://download.bls.gov/pub/time.series/cu/
+
+# CPI Data
+cpi_series_df <- read_delim(paste0(script_dir,
+                                   '/cpi/cu.series'),
+                            delim = '\t',
+                            show_col_types = FALSE,
+                            trim_ws = TRUE)
+cpi_area_df <- read_delim(paste0(script_dir,
+                                   '/cpi/cu.area'),
+                            delim = '\t',
+                            show_col_types = FALSE,
+                            trim_ws = TRUE)
+cpi_item_df <- read_delim(paste0(script_dir,
+                                   '/cpi/cu.item'),
+                            delim = '\t',
+                            show_col_types = FALSE,
+                            trim_ws = TRUE)
+cpi_current_df <- read_delim(paste0(script_dir,
+                                   '/cpi/cu.data.0.Current'),
+                            delim = '\t',
+                            show_col_types = FALSE,
+                            trim_ws = TRUE)
+
+# County/State/Region/Division data
+
+usa_data <- zipcodeR::zip_code_db |>
+  select(major_city, state, county, lat, lng) |>
+  unique() |>
+  transmute(City = major_city,
+         State_Abbr = state,
+         County = sub(' County', '', county),
+         County = ifelse(County == '', NA, County),
+         lat = lat,
+         lng = lng)
+
+usa_map <- data.frame(state.x77,
+                      State_Abbr = state.abb,
+                      Region = state.region,
+                      Division = state.division) |>
+  rownames_to_column(var = 'State') |>
+  tibble() |>
+  select(State_Abbr,
+         State,
+         Region,
+         Division) |>
+  inner_join(usa_data, by = 'State_Abbr') |>
+  tibble()
+
+midwest <- usa_map |>
+  filter(State %in% c('Illinois',
+                       'Indiana',
+                       'Iowa',
+                       'Kansas',
+                       'Michigan',
+                       'Minnesota',
+                       'Missouri',
+                       'Nebraska',
+                       'North Dakota',
+                       'Ohio',
+                       'South Dakota',
+                       'Wisconsin')) |>
+  mutate(Region = 'Midwest') |>
+  tibble()
+
+usa_map <- dplyr::union(usa_map, midwest)
+
+# Region Data Transformations
+cpi_area_df <- cpi_area_df |>
+  mutate(area_junk = ifelse(regexpr('(,|Urban|Seattle)',
+                                    area_name) > 0,
+                             paste0('NA;', area_name),
+                             paste0(area_name, ';NA'))) |>
+  separate(area_junk,
+           c('reg_dev_junk',
+             'state_city_junk'),
+           ';',
+           convert = TRUE) |>
+  mutate(reg_dev_junk = sub(' Size Class ',
+                         ';',
+                         reg_dev_junk),
+         reg_dev_junk = sub('Size Class ',
+                         'NA;',
+                         reg_dev_junk),
+         reg_dev_junk = sub(' -',
+                         '',
+                         reg_dev_junk),
+         reg_dev_junk = ifelse(is.na(reg_dev_junk),
+                               'NA;NA',
+                               ifelse(regexpr(';',
+                                              reg_dev_junk) > 0,
+                                      reg_dev_junk,
+                                      paste0(reg_dev_junk,
+                                             ';NA')))) |>
+  separate(reg_dev_junk,
+           c('reg_dev_junk',
+             'Size_Class'),
+           ';',
+           convert = TRUE) |>
+  mutate(reg_dev_junk = ifelse(is.na(reg_dev_junk),
+                                      'Standard;United States;NA',
+                               ifelse(regexpr('U.S.',
+                                              reg_dev_junk) > 0,
+                                      paste0('Average;United States;NA'),
+                                      paste0('Standard;United States;',
+                                             reg_dev_junk)))) |>
+  separate(reg_dev_junk,
+           c('Measure_Type',
+             'Country',
+             'Region'),
+           ';',
+           convert = TRUE)
+
+# State/City Transformations
+cpi_area_df <- cpi_area_df |>
+  mutate(state_city_junk = ifelse(state_city_junk == 'Urban Hawaii',
+                                  'Honolulu, HI',
+                                  ifelse(state_city_junk == 'Urban Alaska',
+                                         'Anchorage-Fairbanks, AK',
+                                         state_city_junk)),
+         state_city_junk = ifelse(state_city_junk
+                                  == "Seattle-Tacoma-Bellevue WA",
+                                  "Seattle-Tacoma-Bellevue, WA",
+                                  state_city_junk),
+    state_city_junk = ifelse(is.na(state_city_junk),
+                                  'NA;NA',
+                                  ifelse(regexpr(',',
+                                                 state_city_junk) > 0,
+                                         sub(', ',
+                                             ';',
+                                             state_city_junk),
+                                         state_city_junk))) |>
+  separate(state_city_junk,
+           c('City',
+             'State'),
+           ';',
+           convert = TRUE) |>
+  mutate(City = str_split(City, '-'),
+         State = str_split(State, '-')) |>
+  tidyr::unnest(City) |>
+  tidyr::unnest(State)
+
+# in-memory sql connection
+conn <- dbConnect(SQLite(), ":memory:")
+
+dbWriteTable(conn, "cpi_area", cpi_area_df)
+dbWriteTable(conn, "usa_map", usa_map)
+
+area_virgina_exc <- c('Fairfax City',
+                      'Franklin City',
+                      'Lynchburg City',
+                      'Richmond City',
+                      'Roanoke City',
+                      'Charles City',
+                      'James City')
+cpi_county_fix_list <-
+  list(
+    "New Hampshire_Coös" = "Coos",
+    "New York_St Lawrence" = "St. Lawrence",
+    "Illinois_Mclean" = "Mclean",
+    "Illinois_Mchenry" = "Mchenry",
+    "Illinois_La Salle" = "Lasalle",
+    "Indiana_LaGrange" = "Lagrange",
+    "Indiana_La Porte" = "Laporte",
+    "Minnesota_St Louis" = "St. Louis",
+    "Missouri_St Francois" = "St. Francois",
+    "Missouri_Dekalb" = "Dekalb",
+    "Missouri_St Louis" = "St. Louis",
+    "Florida_Desoto" = "Desoto",
+    "Georgia_Dekalb" = "Desalb",
+    'New Mexico_Doña Ana' = 'Dona Ana',
+    "Maryland_St Mary's" = "St. Mary's",
+    "Alabama_St Clair" = "St. Clair",
+    "Louisiana_St Mary" = "St. Mary",
+    "Louisiana_St Martin" = "St. Martin",
+    "Louisiana_St Bernard" = "St. Bernard",
+    "Louisiana_La Salle" = "Lasalle",
+    "Louisiana_St Landry" = "St. Landry",
+    "Louisiana_St Tammany" = "St. Tammany",
+    "Louisiana_St James" = "St. James",
+    "Texas_De Witt" = "Dewitt",
+    "Alaska_Petersburg Census Area" = "Petersburg Borough"
+  )
+
+cpi_area_df <- dbGetQuery(conn,"
+SELECT
+  ca.Area_Code,
+  ca.Area_Name,
+  ca.Display_Level,
+  ca.Selectable,
+  ca.Sort_Sequence,
+  ca.Measure_Type,
+  ca.Size_Class,
+  ca.Country,
+  CASE
+    WHEN um3.State IS NOT NULL THEN 'State'
+    WHEN um2.State IS NOT NULL THEN 'Division'
+    WHEN um.State IS NOT NULL THEN 'Region'
+  END As Join_Method,
+  ca.Region As Orig_Region,
+  ca.City As Orig_City,
+  ca.State As Orig_State,
+  COALESCE(um3.Region,
+    um2.Region,
+    um.Region) As Region,
+  COALESCE(um3.Division,
+    um2.Division,
+    um.Division) As Division,
+  COALESCE(um3.State_Abbr,
+    um2.State_Abbr,
+    um.State_Abbr) As State_Abbr,
+  COALESCE(um3.State,
+    um2.State,
+    um.State) As State,
+  COALESCE(um3.City,
+    um2.City,
+    um.City) As City,
+  COALESCE(um3.County,
+    um2.County,
+    um.County) As County,
+  COALESCE(um3.lat,
+    um2.lat,
+    um.lat) As lat,
+  COALESCE(um3.lng,
+    um2.lng,
+    um.lng) As long
+    
+FROM cpi_area As ca
+LEFT JOIN usa_map As um
+ON
+  ca.Region = um.Region
+LEFT JOIN usa_map As um2
+ON
+  ca.Region = um2.Division
+LEFT JOIN usa_map As um3
+ON
+  ca.State = um3.State_Abbr
+    AND
+  ca.City = um3.City
+") |>
+  tibble() |>
+  mutate(County = ifelse(is.na(County),
+                         County,
+                         str_to_title(County)),
+         County = ifelse(State == 'Virginia' &
+                         str_ends(County, ' City') > 0 &
+                           !(County %in% area_virgina_exc),
+                         str_trim(sub(' City', '', County)),
+                         County),
+         County = ifelse(State == 'Louisiana' &
+                           str_ends(County, ' Parish') > 0,
+                         str_trim(sub(' Parish', '', County)),
+                         County),
+         County = ifelse(paste0(State,
+                         '_',
+                         County) %in% names(cpi_county_fix_list),
+                  as.character(cpi_county_fix_list[paste0(State,
+                         '_',
+                         County)]),
+                  County))
+
+dbWriteTable(conn, "cpi_area2", cpi_area_df)
+
+cpi_area_df2 <- dbGetQuery(conn,"
+SELECT *
+FROM cpi_area2
+
+WHERE
+  Join_Method = 'State'
+
+UNION
+
+SELECT ca.*
+FROM cpi_area2 As ca
+LEFT JOIN cpi_area2 As ca2
+ON
+  ca2.Join_Method = 'State'
+    AND
+  ca2.State_Abbr = ca.State_Abbr
+    AND
+  ca2.County = ca.County
+
+WHERE
+  ca.Join_Method = 'Division'
+    AND
+  ca2.State IS NULL
+") |>
+  tibble()
+
+dbDisconnect(conn)
+
+cpi_data <- cpi_series_df |>
+  inner_join(cpi_current_df, by = 'series_id') |>
+  inner_join(cpi_item_df, by = 'item_code') |>
+  filter(year == 2020 & seasonal == 'U' & area_code != '0000') |>
+  group_by(area_code, item_name) |>
+  summarise(value = sum(value)) |>
+  mutate(item_name = gsub(' ',
+                         '_',
+                         str_trim(paste('CPI',
+                               str_to_title(item_name))))) |>
+  pivot_wider(names_from = 'item_name',
+              values_from = 'value') |>
+  inner_join(cpi_area_df2,
+             by = 'area_code') |>
+  select(!c(area_code,
+            area_name,
+            display_level,
+            selectable,
+            sort_sequence,
+            Measure_Type,
+            Size_Class,
+            Join_Method,
+            Orig_Region,
+            Orig_State,
+            Orig_City,
+            City,
+            Region)) |>
+  mutate(region = paste0(State, '_', County)) |>
+  unique()
+
+cpi_data <- tibble(cpi_data)
+```
+
+```{r cpigdp_join}
+cpi_gdp_data <- gdp_data |>
+  group_by(fips, State, County) |>
+  summarise(GDP = sum(GDP)) |>
+  left_join(cpi_data, by = c('State', 'County')) |>
+  select(!c(Country,
+            area_code,
+            Division,
+            State_Abbr,
+            lat,
+            long,
+            region)) |>
+  filter(!is.na(fips),
+         !(State == 'Virginia' & County == 'Fairfax City')) |>
+  unique() |>
+  tibble() |>
+  select(!c(State, County, `CPI_All_Items_-_Old_Base`))
+
+cpi_gdp_data <- cpi_gdp_data[,
+                       colSums(is.na(cpi_gdp_data)) < nrow(cpi_gdp_data)]
+```
+
+```{r}
+write_csv(cpi_gdp_data,
+          paste(script_dir,
+                'cpi_gdp_data.csv',
+                sep='/'))
+```
+
+```{r}
+cpi_gdp_data |>
+  ggplot(aes(CPI_All_Items, GDP, fill = Division)) +
+  geom_boxplot() +
+  scale_y_log10() +
+  scale_x_log10() +
+  labs(x = "Cost Price Index",
+       y = "Gross Domestic Product",
+       title = 'GDP Rise Higher as Variance Rises') +
+  theme(plot.title = element_text(hjust = 0.5))
+
+cpi_gdp_data |>
+  ggplot(aes(CPI_Food, CPI_All_Items, color = Division)) +
+  geom_point() +
+  scale_y_log10() +
+  scale_x_log10() +
+  labs(x = "Food",
+       y = "All Items",
+       title = 'Cost Price Index Comparison') +
+  theme(plot.title = element_text(hjust = 0.5))
+
+```
